@@ -13,7 +13,7 @@ from tqdm.auto import tqdm
 import lightning as L
 import torch
 import torch.nn as nn
-from lightning.fabric.strategies import FSDPStrategy, DDPStrategy
+from lightning.fabric.strategies import FSDPStrategy, DeepSpeedStrategy, DDPStrategy
 from lightning.fabric.utilities.throughput import ThroughputMonitor, measure_flops
 from torch.utils.data import DataLoader
 from torchmetrics.aggregation import RunningMean
@@ -23,7 +23,8 @@ from litgpt import Tokenizer
 from litgpt.args import EvalArgs, LogArgs, TrainArgs
 from litgpt.config import name_to_config
 from litgpt.data import DataModule, TinyLlama
-from litgpt.model import GPT, Block, CausalSelfAttention, Config, LLaMAMLP
+from litgpt.lora import LoRALayer, GPT, Block, LLaMAMLP, Config, CausalSelfAttention, lora_filter, mark_only_lora_as_trainable
+# from litgpt.model import GPT, Block, CausalSelfAttention, Config, LLaMAMLP
 from litgpt.utils import (
     CycleIterator,
     capture_hparams,
@@ -43,6 +44,16 @@ from litgpt.utils import (
     save_hyperparameters,
 )
 
+from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
+from transformers.trainer_pt_utils import get_parameter_names
+
+
+def _get_decay_parameter_names(model) -> list[str]:
+    r"""Return a list of names of parameters with weight decay. (weights in non-layernorm layers)."""
+    decay_parameters = get_parameter_names(model, ALL_LAYERNORM_LAYERS)
+    decay_parameters = [name for name in decay_parameters if "bias" not in name]
+    return decay_parameters
+
 
 def setup(
     model_name: str,
@@ -51,6 +62,15 @@ def setup(
     precision: Literal["bf16-true", "bf16-mixed", "32-true", None] = None,
     initial_checkpoint_dir: Optional[Path] = None,
     resume: Union[bool, Literal["auto"], Path] = False,
+    lora_r: int = 32,
+    lora_alpha: int = 16,
+    lora_dropout: float = 0.05,
+    lora_query: bool = True,
+    lora_key: bool = False,
+    lora_value: bool = True,
+    lora_projection: bool = False,
+    lora_mlp: bool = False,
+    lora_head: bool = False,
     data: Optional[DataModule] = None,
     train: TrainArgs = TrainArgs(
         save_interval=1000,
@@ -123,14 +143,22 @@ def setup(
     data = TinyLlama() if data is None else data
 
     config = Config.from_name(model_name) if model_config is None else model_config
+    config.lora_r = lora_r
+    config.lora_alpha = lora_alpha
+    config.lora_dropout = lora_dropout
+    config.lora_query = lora_query
+    config.lora_key = lora_key
+    config.lora_value = lora_value
+    config.lora_projection = lora_projection
+    config.lora_mlp = lora_mlp
+    config.lora_head = lora_head
     precision = precision or get_default_supported_precision(training=True)
-    devices = parse_devices(devices)
 
     ########################
     # Setup logger
     ########################
     project_name = f"sPOET-{model_name}-{train.max_tokens/1e9}B-tokens-dev"
-    run_name = f"adamw-lr-{optimizer['init_args']['lr']}-min_lr_ratio-{train.min_lr_ratio}-wd-{optimizer['init_args']['weight_decay']}-warmup-{train.lr_warmup_steps}-max_norm-{train.max_norm}"
+    run_name = f"lora-bs-{lora_r}-lr-{optimizer['init_args']['lr']}-min_lr_ratio-{train.min_lr_ratio}-wd-{optimizer['init_args']['weight_decay']}-warmup-{train.lr_warmup_steps}-max_norm-{train.max_norm}"
     out_dir = Path(f"saves/{project_name}/{run_name}")
     out_dir = init_out_dir(out_dir)
     logger = choose_logger(
@@ -148,7 +176,7 @@ def setup(
     tokenizer = Tokenizer(tokenizer_dir) if tokenizer_dir is not None else None
 
     if devices * num_nodes > 1:
-        # strategy = FSDPStrategy(auto_wrap_policy={Block}, state_dict_type="full", sharding_strategy="FULL_SHARD")
+        # strategy = FSDPStrategy(auto_wrap_policy={Block}, state_dict_type="full", sharding_strategy="HYBRID_SHARD")
         strategy = DDPStrategy()
     else:
         strategy = "auto"
@@ -210,6 +238,23 @@ def main(
         model = GPT(config)
 
     initialize_weights(fabric, model, n_layer=config.n_layer, n_embd=config.n_embd)
+    mark_only_lora_as_trainable(model)
+
+    # Update the Lora layers
+    frozen_base_ids = set()
+    for name, module in model.named_modules():
+        if isinstance(module, LoRALayer):
+            print(name)
+            base = module.linear
+            for param in base.parameters(recurse=True):
+                frozen_base_ids.add(id(param))
+    
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            continue
+        if id(param) in frozen_base_ids:
+            continue
+        param.requires_grad = True
 
     if train.tie_embeddings:
         model.transformer.wte.weight = model.lm_head.weight
@@ -221,10 +266,40 @@ def main(
 
     # model = torch.compile(model)
     model = fabric.setup(model)
+    
+    extra_kwargs = {"fused": fabric.device.type == "cuda"}
+    lora_params = []
+    for name, param in model.named_parameters():
+        if param.requires_grad and 'lora' in name:
+            lora_params.append(param)
 
-    # extra_kwargs = {"fused": fabric.device.type == "cuda"}
-    optimizer = instantiate_torch_optimizer(optimizer, model.parameters()) #, **extra_kwargs)
+    id_lora_params = {id(param) for param in lora_params}
+    decay_params, nodecay_params = [], []  # they are non-lora parameters
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if id(param) in id_lora_params:
+            continue
+        if param.ndim >= 2 and not name.endswith('bias'):
+            decay_params.append(param)
+        else:
+            nodecay_params.append(param)
+
+    base_lr = optimizer['init_args'].pop('lr')
+    weight_decay = optimizer['init_args'].pop('weight_decay')
+
+    param_groups = [
+        dict(params=nodecay_params, weight_decay=0.0, lr=base_lr),
+        dict(params=decay_params, weight_decay=weight_decay, lr=base_lr),
+        dict(params=lora_params, weight_decay=weight_decay, lr=base_lr),
+    ]
+
+    # optimizer = instantiate_torch_optimizer(optimizer, model.parameters())
+    optimizer = instantiate_torch_optimizer(optimizer, param_groups, **extra_kwargs)
     optimizer = fabric.setup_optimizers(optimizer)
+
+    fabric.print(f"Number of trainable parameters: {num_parameters(model, requires_grad=True):,}")
+    fabric.print(f"Number of non-trainable parameters: {num_parameters(model, requires_grad=False):,}")
 
     train_dataloader, val_dataloader = get_dataloaders(fabric, data, tokenizer, train, model.max_seq_length)
     train_dataloader, val_dataloader = fabric.setup_dataloaders(train_dataloader, val_dataloader)
@@ -238,6 +313,8 @@ def main(
         "train_dataloader": train_dataloader,
         "iter_num": 0,
         "step_count": 0,
+        "lr": base_lr,
+        "min_lr": base_lr * train.min_lr_ratio,
     }
 
     resume = find_resume_path(resume, out_dir)
@@ -345,20 +422,19 @@ def fit(
     # setup tqdm progress bar over the training steps
     grad_accum = train.gradient_accumulation_iters(devices, num_nodes)
     max_steps = max_iters // grad_accum
-    min_lr = optimizer.defaults["lr"] * train.min_lr_ratio
     # pbar = tqdm(
     #     total=max_steps,
-    #     desc="Training",
-    #     dynamic_ncols=True,
-    #     disable=fabric.global_rank !=0,
-    # )
-
+    #    desc="Training",
+    #    dynamic_ncols=True,
+    #    disable=fabric.global_rank !=0,
+    #)
+    
     for train_data in train_iterator:
         if state["iter_num"] >= max_iters:
             break
 
         # determine and set the learning rate for this iteration
-        lr = get_lr(optimizer.defaults["lr"], state["iter_num"], warmup_iters, max_iters, min_lr)
+        lr = get_lr(state["lr"], state["iter_num"], warmup_iters, max_iters, state["min_lr"])
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
@@ -377,7 +453,7 @@ def fit(
         running_loss.update(loss.detach())
 
         if not is_accumulating:
-            grad_norm_before_clip = fabric.clip_gradients(model, optimizer, max_norm=train.max_norm)
+            fabric.clip_gradients(model, optimizer, max_norm=train.max_norm)
             optimizer.step()
             optimizer.zero_grad()
             state["step_count"] += 1
@@ -395,7 +471,6 @@ def fit(
             )
             metrics = {
                 "loss": loss,
-                "grad_norm_before_clip": grad_norm_before_clip,
                 "iter": state["iter_num"],
                 "step": state["step_count"],
                 "epoch": train_iterator.epoch,
@@ -410,7 +485,7 @@ def fit(
             if isinstance(val_loss, float):
                 val_loss = f"{val_loss:.3f}"
             fabric.print(
-                f"Epoch {metrics['epoch'] + 1} | step / max_steps: {metrics['step']} / {max_steps} |"
+                f"Epoch {metrics['epoch'] + 1} | iter {metrics['iter']} step {metrics['step']} |"
                 f" loss train: {metrics['loss']:.3f},"
                 f" val: {val_loss} |"
                 f" iter time: {metrics['iter_time'] * 1000:.2f} ms"
@@ -454,8 +529,7 @@ def validate(
     model.eval()
 
     losses = []
-    total_val_iters = min(len(val_dataloader), max_iters)
-    for k, batch in tqdm(enumerate(val_dataloader), total=total_val_iters, desc="Validating", disable=fabric.global_rank != 0):
+    for k, batch in enumerate(val_dataloader):
         if k >= max_iters:
             break
         input_ids = batch[:, 0 : model.max_seq_length].contiguous().long()
@@ -502,9 +576,14 @@ def initialize_weights(fabric: L.Fabric, model: GPT, n_layer: int, n_embd: int) 
     # Adapted from https://github.com/jzhang38/TinyLlama
 
     def init_weights(module, std):
-        nn.init.normal_(module.weight, mean=0.0, std=std)
-        if getattr(module, "bias", None) is not None:
-            nn.init.zeros_(module.bias)
+        if isinstance(module, LoRALayer):
+            nn.init.normal_(module.linear.weight, mean=0.0, std=std)
+            if getattr(module.linear, "bias", None) is not None:
+                nn.init.zeros_(module.linear.bias)
+        else:
+            nn.init.normal_(module.weight, mean=0.0, std=std)
+            if getattr(module, "bias", None) is not None:
+                nn.init.zeros_(module.bias)
 
     for mod in model.modules():
         if isinstance(mod, (nn.Embedding, nn.Linear)):

@@ -12,7 +12,7 @@ from litgpt.finetune.adapter import setup as finetune_adapter_fn
 from litgpt.finetune.adapter_v2 import setup as finetune_adapter_v2_fn
 from litgpt.finetune.full import setup as finetune_full_fn
 from litgpt.finetune.lora import setup as finetune_lora_fn
-from litgpt.finetune.lora_legacy import setup as finetune_lora_legacy_fn
+from litgpt.finetune.oft import setup as finetune_oft_fn
 from litgpt.generate.adapter import main as generate_adapter_fn
 from litgpt.generate.adapter_v2 import main as generate_adapter_v2_fn
 from litgpt.generate.base import main as generate_base_fn
@@ -21,6 +21,9 @@ from litgpt.generate.sequentially import main as generate_sequentially_fn
 from litgpt.generate.speculative_decoding import main as generate_speculatively_fn
 from litgpt.generate.tp import main as generate_tp_fn
 from litgpt.pretrain import setup as pretrain_fn
+from litgpt.pretrain_ngpt import setup as pretrain_ngpt_fn
+from litgpt.pretrain_poet import setup as pretrain_poet_fn
+from litgpt.pretrain_lora import setup as pretrain_lora_fn
 from litgpt.scripts.convert_hf_checkpoint import convert_hf_checkpoint as convert_hf_checkpoint_fn
 from litgpt.scripts.convert_lit_checkpoint import convert_lit_checkpoint as convert_lit_checkpoint_fn
 from litgpt.scripts.convert_pretrained_checkpoint import (
@@ -36,11 +39,14 @@ def main() -> None:
         "chat": chat_fn,
         "finetune": finetune_lora_fn,
         "finetune_lora": finetune_lora_fn,
-        "finetune_lora_legacy": finetune_lora_legacy_fn,
+        "finetune_oft": finetune_oft_fn,
         "finetune_full": finetune_full_fn,
         "finetune_adapter": finetune_adapter_fn,
         "finetune_adapter_v2": finetune_adapter_v2_fn,
         "pretrain": pretrain_fn,
+        "pretrain_poet": pretrain_poet_fn,
+        "pretrain_lora": pretrain_lora_fn,
+        "pretrain_ngpt": pretrain_ngpt_fn,
         "generate": generate_base_fn,
         "generate_full": generate_full_fn,
         "generate_adapter": generate_adapter_fn,

@@ -2,6 +2,7 @@
 
 """Utility functions for training and inference."""
 
+from curses import beep
 import inspect
 import json
 import math
@@ -25,7 +26,7 @@ import torch.nn as nn
 import torch.utils._device
 import yaml
 from lightning.fabric.loggers import CSVLogger, TensorBoardLogger
-from lightning.fabric.strategies import FSDPStrategy, ModelParallelStrategy
+from lightning.fabric.strategies import FSDPStrategy
 from lightning.fabric.utilities.load import _lazy_load as lazy_load
 from lightning.pytorch.cli import instantiate_class
 from lightning.pytorch.loggers import MLFlowLogger, WandbLogger
@@ -33,6 +34,8 @@ from lightning_utilities.core.imports import module_available
 from packaging import version
 from torch.serialization import normalize_storage_type
 from typing_extensions import Self
+
+from litgpt.soft_adamw import SOFTAdamW
 
 if TYPE_CHECKING:
     from litgpt import GPT, Config
@@ -78,6 +81,7 @@ def num_parameters(module: nn.Module, requires_grad: Optional[bool] = None) -> i
 def reset_parameters(module: nn.Module) -> None:
     """Calls `reset_parameters` on the module and all its submodules."""
     for mod in module.modules():
+        print(mod)
         if callable(getattr(mod, "reset_parameters", None)):
             mod.reset_parameters()
 
@@ -379,15 +383,6 @@ def get_default_supported_precision(training: bool) -> str:
 def load_checkpoint(fabric: L.Fabric, model: nn.Module, checkpoint_path: Path, strict: bool = True) -> None:
     if isinstance(fabric.strategy, FSDPStrategy):
         fabric.load_raw(checkpoint_path, model, strict=strict)
-    elif isinstance(fabric.strategy, ModelParallelStrategy):
-        state_dict = torch.load(checkpoint_path, mmap=True)
-        load_from_full_model_state_dict(
-            model=model,
-            full_sd=state_dict,
-            device=fabric.device,
-            strict=strict,
-            cpu_offload=True,
-        )
     else:
         state_dict = lazy_load(checkpoint_path)
         state_dict = state_dict.get("model", state_dict)
@@ -405,41 +400,6 @@ def load_checkpoint_update(
         adapter_cp = lazy_load(adapter_path)
         state_dict.update(adapter_cp)
         model.load_state_dict(state_dict, strict=strict)
-
-
-def load_from_full_model_state_dict(
-    model: torch.nn.Module,
-    full_sd: Dict[str, Any],
-    device: torch.device,
-    strict: bool = False,
-    cpu_offload: bool = False,
-):
-    from torch.distributed._tensor import distribute_tensor
-
-    meta_sharded_sd = model.state_dict()
-    sharded_sd = {}
-    print(meta_sharded_sd.keys())
-    for param_name, full_tensor in full_sd.items():
-        if "norm" not in param_name and "wte" not in param_name and "ln_f" not in param_name:
-            param_name = param_name.replace(".weight", ".linear.weight")
-            param_name = param_name.replace(".bias", ".linear.bias")
-        else:
-            param_name = param_name
-
-        print(param_name)
-
-        sharded_meta_param = meta_sharded_sd.get(param_name)
-        full_tensor = full_tensor.to(sharded_meta_param.dtype).to(device)
-        sharded_tensor = distribute_tensor(
-            full_tensor,
-            sharded_meta_param.device_mesh,
-            sharded_meta_param.placements,
-        )
-        if cpu_offload:
-            sharded_tensor = sharded_tensor.cpu()
-        sharded_sd[param_name] = torch.nn.Parameter(sharded_tensor)
-    # choose `assign=True` since we cannot call `copy_` on meta tensor
-    return model.load_state_dict(sharded_sd, strict=strict, assign=True)
 
 
 def flops_per_param(max_seq_length: int, n_layer: int, n_embd: int, n_params: int) -> int:
@@ -595,8 +555,12 @@ def choose_logger(
     if logger_name == "tensorboard":
         return TensorBoardLogger(root_dir=(out_dir / "logs"), name="tensorboard", **kwargs)
     if logger_name == "wandb":
-        project = log_args.pop("project", name)
+        project = log_args.pop("project", None)
+        if project is None:
+            project = kwargs.pop("project_name", None)
         run = log_args.pop("run", os.environ.get("WANDB_RUN_NAME"))
+        if run is None:
+            run = kwargs.pop("run_name", None)
         group = log_args.pop("group", os.environ.get("WANDB_RUN_GROUP"))
         return WandbLogger(project=project, name=run, group=group, resume=resume, **kwargs)
     if logger_name == "mlflow":
@@ -650,15 +614,22 @@ def instantiate_torch_optimizer(optimizer, model_parameters, **kwargs):
         optimizer = optimizer_cls(model_parameters, **kwargs)
     elif isinstance(optimizer, dict):
         optimizer = dict(optimizer)
-        class_module, class_name = optimizer["class_path"].rsplit(".", 1)
-        module = __import__(class_module, fromlist=[class_name])
-        optimizer_cls = getattr(module, class_name)
+        if optimizer["class_path"] == "SOFTAdamW":
+            # valid_params = set(inspect.signature(optimizer_cls).parameters)
+            # kwargs = {key: value for key, value in dict(kwargs).items() if key in valid_params}
 
-        valid_params = set(inspect.signature(optimizer_cls).parameters)
-        kwargs = {key: value for key, value in dict(kwargs).items() if key in valid_params}
+            optimizer["init_args"].update(kwargs)
+            optimizer = SOFTAdamW(model_parameters, **optimizer["init_args"])
+        else:
+            class_module, class_name = optimizer["class_path"].rsplit(".", 1)
+            module = __import__(class_module, fromlist=[class_name])
+            optimizer_cls = getattr(module, class_name)
 
-        optimizer["init_args"].update(kwargs)
-        optimizer = instantiate_class(model_parameters, optimizer)
+            valid_params = set(inspect.signature(optimizer_cls).parameters)
+            kwargs = {key: value for key, value in dict(kwargs).items() if key in valid_params}
+
+            optimizer["init_args"].update(kwargs)
+            optimizer = instantiate_class(model_parameters, optimizer)
     else:
         raise ValueError(f'Unrecognized "optimizer" value: {optimizer}')
 
@@ -666,10 +637,10 @@ def instantiate_torch_optimizer(optimizer, model_parameters, **kwargs):
 
 
 def extend_checkpoint_dir(checkpoint_dir: Path) -> Path:
-    new_checkpoint_dir = "checkpoints" / checkpoint_dir
+    new_checkpoint_dir = "/tmp/huggingface" / checkpoint_dir
     should_return_new_dir = (
         not checkpoint_dir.is_dir()
-        and checkpoint_dir.parts[0] != "checkpoints"
+        and checkpoint_dir.parts[0] != "tmp"
         and not checkpoint_dir.is_absolute()
         and new_checkpoint_dir.exists()
     )
@@ -706,7 +677,9 @@ def auto_download_checkpoint(model_name, access_token=None, ignore_tokenizer_fil
 
         if checkpoint_dir.parts[0] != "checkpoints" and not checkpoint_dir.is_absolute():
             download_from_hub(repo_id=str(model_name), access_token=access_token)
-            checkpoint_dir = Path("checkpoints") / checkpoint_dir
+            checkpoint_dir = Path("/tmp/huggingface") / checkpoint_dir
+        elif checkpoint_dir.is_absolute():
+            return checkpoint_dir
         else:
             raise e
 

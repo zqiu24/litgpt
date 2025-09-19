@@ -3,6 +3,7 @@ import dataclasses
 import math
 import os
 import time
+import warnings
 from tqdm.auto import tqdm
 from pathlib import Path
 from pprint import pprint
@@ -10,15 +11,19 @@ from typing import Dict, List, Literal, Optional, Tuple, Union
 
 import lightning as L
 import torch
-from lightning.fabric.strategies import FSDPStrategy
+from lightning.fabric.plugins import BitsandbytesPrecision
+from lightning.fabric.strategies import FSDPStrategy, DDPStrategy
+from lightning.fabric.utilities import ThroughputMonitor
+from lightning_utilities.core.imports import RequirementCache
 from torch.utils.data import ConcatDataset, DataLoader
 from torchmetrics import RunningMean
 
 from litgpt.args import EvalArgs, LogArgs, TrainArgs
 from litgpt.data import Alpaca, DataModule
 from litgpt.generate.base import generate
-from litgpt.model import GPT, Block, Config
+from litgpt.oft import GPT, Block, Config, oft_filter, mark_only_oft_as_trainable, OFTLayer
 from litgpt.prompts import save_prompt_style
+from litgpt.scripts.merge_oft import merge_oft
 from litgpt.tokenizer import Tokenizer
 from litgpt.utils import (
     CycleIterator,
@@ -29,9 +34,9 @@ from litgpt.utils import (
     chunked_cross_entropy,
     copy_config_files,
     create_finetuning_performance_report,
-    find_resume_path,
     get_default_supported_precision,
     init_out_dir,
+    instantiate_bnb_optimizer,
     instantiate_torch_optimizer,
     load_checkpoint,
     num_parameters,
@@ -43,11 +48,19 @@ from litgpt.utils import (
 
 def setup(
     checkpoint_dir: Path,
-    out_dir: Path = Path("out/finetune/full"),
+    out_dir: Path = Path("out/finetune/oft"),
     precision: Optional[str] = None,
+    quantize: Optional[Literal["bnb.nf4", "bnb.nf4-dq", "bnb.fp4", "bnb.fp4-dq", "bnb.int8-training"]] = None,
     devices: Union[int, str] = 1,
     num_nodes: int = 1,
-    resume: Union[bool, Literal["auto"], Path] = False,
+    oft_block_size: int = 32,
+    oft_dropout: float = 0.0,
+    oft_query: bool = True,
+    oft_key: bool = False,
+    oft_value: bool = True,
+    oft_projection: bool = False,
+    oft_mlp: bool = False,
+    oft_head: bool = False,
     data: Optional[DataModule] = None,
     train: TrainArgs = TrainArgs(
         save_interval=1000,
@@ -56,27 +69,33 @@ def setup(
         micro_batch_size=1,
         lr_warmup_steps=100,
         epochs=5,
-        max_seq_length=None,
+        max_seq_length=512,
     ),
-    eval: EvalArgs = EvalArgs(interval=600, max_new_tokens=100, max_iters=100),
     log: LogArgs = LogArgs(),
+    eval: EvalArgs = EvalArgs(interval=100, max_new_tokens=100, max_iters=100),
     optimizer: Union[str, Dict] = "AdamW",
     logger_name: Literal["wandb", "tensorboard", "csv", "mlflow"] = "csv",
     seed: int = 1337,
     access_token: Optional[str] = None,
 ) -> None:
-    """Finetune a model.
+    """Finetune a model using the OFT method.
 
     Arguments:
         checkpoint_dir: The path to the base model's checkpoint directory to load for finetuning.
         out_dir: Directory in which to save checkpoints and logs. If running in a Lightning Studio Job, look for it in
             /teamspace/jobs/<job-name>/share.
         precision: The precision to use for finetuning. Possible choices: "bf16-true", "bf16-mixed", "32-true".
-        devices: How many devices/GPUs to use
+        quantize: If set, quantize the model with this algorithm. See ``tutorials/quantize.md`` for more information.
+        devices: How many devices/GPUs to use.
         num_nodes: How many nodes the code is being run on.
-        resume: Path to a checkpoint directory to resume from in case training was interrupted, or ``True`` to resume
-            from the latest checkpoint in ``out_dir``. An error will be raised if no checkpoint is found. Passing
-            ``'auto'`` will resume from the latest checkpoint but not error if no checkpoint exists.
+        oft_block_size: The OFT block size.
+        oft_dropout: The OFT dropout value.
+        oft_query: Whether to apply OFT to the query weights in attention.
+        oft_key: Whether to apply OFT to the key weights in attention.
+        oft_value: Whether to apply OFT to the value weights in attention.
+        oft_projection: Whether to apply OFT to the output projection in the attention block.
+        oft_mlp: Whether to apply OFT to the weights of the MLP in the attention block.
+        oft_head: Whether to apply OFT to output head in GPT.
         data: Data-related arguments. If not provided, the default is ``litgpt.data.Alpaca``.
         train: Training-related arguments. See ``litgpt.args.TrainArgs`` for details.
         eval: Evaluation-related arguments. See ``litgpt.args.EvalArgs`` for details.
@@ -93,41 +112,76 @@ def setup(
 
     if not checkpoint_dir.is_absolute():
         check_valid_checkpoint_dir(checkpoint_dir)
-    config = Config.from_file(checkpoint_dir / "model_config.yaml")
+    config = Config.from_file(
+        checkpoint_dir / "model_config.yaml",
+        oft_block_size=oft_block_size,
+        oft_dropout=oft_dropout,
+        oft_query=oft_query,
+        oft_key=oft_key,
+        oft_value=oft_value,
+        oft_projection=oft_projection,
+        oft_mlp=oft_mlp,
+        oft_head=oft_head,
+    )
 
     precision = precision or get_default_supported_precision(training=True)
     logger = choose_logger(
         logger_name,
         out_dir,
         name=f"finetune-{config.name}",
-        resume=bool(resume),
         log_interval=train.log_interval,
         log_args=dataclasses.asdict(log),
     )
 
+    plugins = None
+    if quantize is not None and quantize.startswith("bnb."):
+        if "mixed" in precision:
+            raise ValueError("Quantization and mixed precision is not supported.")
+        if RequirementCache("bitsandbytes != 0.42.0"):
+            warnings.warn(
+                "LitGPT only supports bitsandbytes v0.42.0. This may result in errors when using quantization."
+            )
+        dtype = {"16-true": torch.float16, "bf16-true": torch.bfloat16, "32-true": torch.float32}[precision]
+        plugins = BitsandbytesPrecision(quantize[4:], dtype)
+        precision = None
+
     if devices * num_nodes > 1:
+        if quantize:
+            raise NotImplementedError(
+                "Quantization is currently not supported for multi-GPU training. Please set devices=1 and num_nodes=1"
+                " when using the --quantize flag."
+            )
+        '''
         strategy = FSDPStrategy(
-            auto_wrap_policy={Block},
+            auto_wrap_policy={torch.nn.Linear},
             activation_checkpointing_policy={Block},
             state_dict_type="full",
             limit_all_gathers=True,
             cpu_offload=False,
         )
+        '''
+        strategy = DDPStrategy()
     else:
         strategy = "auto"
 
-    fabric = L.Fabric(devices=devices, num_nodes=num_nodes, strategy=strategy, precision=precision, loggers=logger)
+    fabric = L.Fabric(
+        devices=devices,
+        num_nodes=num_nodes,
+        strategy=strategy,
+        precision=precision,
+        loggers=logger,
+        plugins=plugins,
+    )
 
     if torch.cuda.is_available() and devices > 1:
         check_nvlink_connectivity(fabric)
 
-    fabric.launch(main, devices, resume, seed, config, data, checkpoint_dir, out_dir, train, eval, optimizer, num_nodes)
+    fabric.launch(main, devices, seed, config, data, checkpoint_dir, out_dir, train, eval, optimizer, num_nodes)
 
 
 def main(
     fabric: L.Fabric,
     devices: int,
-    resume: Union[bool, Literal["auto"], Path],
     seed: int,
     config: Config,
     data: DataModule,
@@ -153,77 +207,101 @@ def main(
     checkpoint_path = checkpoint_dir / "lit_model.pth"
     with fabric.init_module(empty_init=(fabric.world_size > 1)):
         model = GPT(config)
+    # mark_only_oft_as_trainable(model)
+
+    # Update the OFT layers    
+    for name, param in model.named_parameters():
+        if 'oft_' in name:
+            param.requires_grad = True
+        if 'lm_head' in name and config.oft_head is False:
+            param.requires_grad = True
+
+    for name, param in model.named_parameters():
+        print(name, param.shape, param.requires_grad)
+    breakpoint()
 
     fabric.print(f"Number of trainable parameters: {num_parameters(model, requires_grad=True):,}")
+    fabric.print(f"Number of non-trainable parameters: {num_parameters(model, requires_grad=False):,}")
+    
+    model = fabric.setup_module(model)
+    # model = torch.compile(model, dynamic=True, options={"triton.cudagraphs": False})
+    
+    if isinstance(fabric.strategy.precision, BitsandbytesPrecision):
+        optimizer = instantiate_bnb_optimizer(optimizer, model.parameters())
 
-    model = fabric.setup(model)
+        from bitsandbytes.nn import StableEmbedding
 
-    optimizer = instantiate_torch_optimizer(optimizer, model.parameters())
+        old_embedding = model.transformer.wte
+        model.transformer.wte = StableEmbedding(old_embedding.num_embeddings, old_embedding.embedding_dim)
+        with torch.no_grad():
+            model.transformer.wte.weight.copy_(old_embedding.weight)
+        model.transformer.wte = model.transformer.wte.to(
+            device=old_embedding.weight.device, dtype=old_embedding.weight.dtype
+        )
+    else:
+        optimizer = instantiate_torch_optimizer(optimizer, model.parameters())
+
     optimizer = fabric.setup_optimizers(optimizer)
     scheduler = get_lr_scheduler(optimizer, warmup_steps=train.lr_warmup_steps, max_steps=lr_max_steps)
-    state = {"model": model, "optimizer": optimizer, "scheduler": scheduler, "iter_num": 0, "step_count": 0}
 
-    resume = find_resume_path(resume, out_dir)
-    if resume:
-        fabric.print(f"Resuming training from {resume}")
-        fabric.load(resume, state)
-    else:
-        load_checkpoint(fabric, state["model"], checkpoint_path, strict=False)
+    # strict=False because missing keys due to OFT weights not contained in state dict
+    load_checkpoint(fabric, model, checkpoint_path, strict=False)
 
     train_time = time.perf_counter()
     token_counts = fit(
         fabric=fabric,
-        state=state,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
         train_dataloader=train_dataloader,
         val_dataloader=val_dataloader,
         devices=devices,
         num_nodes=num_nodes,
-        resume=resume,
         checkpoint_dir=checkpoint_dir,
         out_dir=out_dir,
         train=train,
         eval=eval,
         data=data,
     )
+
     training_time = time.perf_counter() - train_time
     output = create_finetuning_performance_report(training_time, token_counts, fabric.device.type)
     fabric.print(output)
 
     # Final evaluation
-    if eval.final_validation:
-        val_loss = validate(fabric, model, val_dataloader, dataclasses.replace(eval, max_iters=len(val_dataloader)))
-        metrics = {"val_loss": val_loss, "val_ppl": math.exp(val_loss)}
-        fabric.log_dict(metrics, step=state["iter_num"])
-        fabric.print(f"Final evaluation | val loss: {val_loss.item():.3f} | val ppl: {math.exp(val_loss):.3f}")
+    # if eval.final_validation:
+    #     val_loss = validate(fabric, model, val_dataloader, dataclasses.replace(eval, max_iters=len(val_dataloader)))
+    #     metrics = {"val_loss": val_loss, "val_ppl": math.exp(val_loss)}
+    #     fabric.log_dict(metrics)
+    #     fabric.print(f"Final evaluation | val loss: {val_loss.item():.3f} | val ppl: {math.exp(val_loss):.3f}")
 
-    # Save the final checkpoint at the end of training
-    save_path = out_dir / "final" / "lit_model.pth"
+    # Save the final OFT checkpoint at the end of training
+    save_path = out_dir / "final" / "lit_model.pth.oft"
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    fabric.save(save_path, {"model": state["model"]})
+    save_oft_checkpoint(fabric, model, save_path)
     if fabric.global_rank == 0:
         # Copy checkpoint files from original checkpoint dir
         copy_config_files(checkpoint_dir, save_path.parent)
         save_hyperparameters(setup, save_path.parent)
         save_prompt_style(data.prompt_style, save_path.parent)
+        merge_oft(checkpoint_dir=save_path.parent)
 
 
 def fit(
     fabric: L.Fabric,
-    state: Dict,
+    model: GPT,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler,
     train_dataloader: DataLoader,
     val_dataloader: DataLoader,
     devices: int,
-    resume: Union[bool, Literal["auto"], Path],
     checkpoint_dir: Path,
     out_dir: Path,
     train: TrainArgs,
     eval: EvalArgs,
     data: DataModule,
     num_nodes: int = 1,
-) -> None:
-    model = state["model"]
-    optimizer = state["optimizer"]
-    scheduler = state["scheduler"]
+) -> dict:
     tokenizer = Tokenizer(checkpoint_dir)
     longest_seq_length, longest_seq_ix = get_longest_seq_length(
         ConcatDataset([train_dataloader.dataset, val_dataloader.dataset])
@@ -234,41 +312,30 @@ def fit(
         f" {model.max_seq_length} and context length is {model.config.block_size}"
     )
 
+    # if eval.initial_validation:
+    #     val_loss = validate(fabric, model, val_dataloader, dataclasses.replace(eval, max_iters=len(val_dataloader)))
+    #     val_loss = f"{val_loss:.3f}"
+    # else:
+    #     fabric.print("Verifying settings ...")
+    #     validate(fabric, model, val_dataloader, dataclasses.replace(eval, max_iters=2), verbose=False)  # sanity check
+    #     val_loss = "n/a"
+
+    train_iterator = CycleIterator(train_dataloader)
+    throughput = ThroughputMonitor(fabric, window_size=50)
+    running_loss = RunningMean(window=train.gradient_accumulation_iters(devices, num_nodes), sync_on_compute=False).to(
+        fabric.device
+    )
+    max_steps = train.max_steps or float("inf")
+    step_count = 0
+    iter_num = 0
+    total_lengths = 0
+    total_t0 = time.perf_counter()
+
     token_counts = {
         "raw_tokens": torch.tensor(0, device=fabric.device, dtype=torch.long),
         "raw_tokens_plus_prompt_template": torch.tensor(0, device=fabric.device, dtype=torch.long),
         "raw_tokens_plus_prompt_template_and_padding": torch.tensor(0, device=fabric.device, dtype=torch.long),
     }
-
-    if eval.initial_validation:
-        val_loss = validate(fabric, model, val_dataloader, dataclasses.replace(eval, max_iters=len(val_dataloader)))
-        val_loss = f"{val_loss:.3f}"
-    else:
-        fabric.print("Verifying settings ...")
-        validate(fabric, model, val_dataloader, dataclasses.replace(eval, max_iters=2), verbose=False)  # sanity check
-        val_loss = "n/a"
-
-    initial_iter = state["iter_num"]
-    max_steps = train.max_steps or float("inf")
-    train_iterator = CycleIterator(train_dataloader)
-
-    # resume data loader state by fast-forwarding through all seen batches
-    if resume:
-        resume_t0 = time.perf_counter()
-        for resume_iter in range(initial_iter):
-            next(train_iterator)
-            if resume_iter % 1000 == 0:
-                fabric.print(f"Resuming dataset: {resume_iter} / {initial_iter}")
-        fabric.barrier()
-        fabric.print(
-            f"Resuming data loader finished. Took {time.perf_counter() - resume_t0:.1f} seconds to reach iteration"
-            f" {initial_iter}."
-        )
-
-    running_loss = RunningMean(window=train.gradient_accumulation_iters(devices, num_nodes), sync_on_compute=False).to(
-        fabric.device
-    )
-    fabric.barrier()
 
     # setup tqdm progress bar over the training steps
     grad_accum = train.gradient_accumulation_iters(devices, num_nodes)
@@ -283,20 +350,21 @@ def fit(
         disable=fabric.global_rank !=0,
     )
 
-    while state["step_count"] < max_steps:
-        state["iter_num"] += 1
+    while step_count < max_steps:
+        iter_num += 1
         iter_t0 = time.perf_counter()
         batch = next(train_iterator)
         if train_iterator.epoch >= train.epochs:
             break
         input_ids, targets = batch["input_ids"], batch["labels"]
 
-        is_accumulating = state["iter_num"] % train.gradient_accumulation_iters(devices, num_nodes) != 0
+        is_accumulating = iter_num % train.gradient_accumulation_iters(devices, num_nodes) != 0
         with fabric.no_backward_sync(model, enabled=is_accumulating):
-            logits = model(input_ids)
+            # torch.compiler.cudagraph_mark_step_begin()
+            logits = model(input_ids, lm_head_chunk_size=128)
             # shift the targets such that output n predicts token n+1
-            # loss = chunked_cross_entropy(logits[..., :-1, :], targets[..., 1:])
-            loss = chunked_cross_entropy(logits[..., :-1, :], targets[..., 1:], chunk_size=0)
+            logits[-1] = logits[-1][..., :-1, :]
+            loss = chunked_cross_entropy(logits, targets[..., 1:])
             fabric.backward(loss / train.gradient_accumulation_iters(devices, num_nodes))
 
         running_loss.update(loss.detach())
@@ -305,7 +373,7 @@ def fit(
             optimizer.step()
             optimizer.zero_grad()
             scheduler.step()
-            state["step_count"] += 1
+            step_count += 1
             pbar.update(1)
 
         token_counts["raw_tokens"] += batch["token_counts"]["raw"].sum().item()
@@ -314,31 +382,40 @@ def fit(
         )
         token_counts["raw_tokens_plus_prompt_template_and_padding"] += input_ids.numel()
 
-        if state["iter_num"] % train.log_interval == 0:
+        total_lengths += input_ids.numel()
+        if iter_num % train.log_interval == 0:
             loss = running_loss.compute().item()  # expensive device-to-host synchronization
             t1 = time.perf_counter()
+            throughput.update(
+                time=t1 - total_t0, batches=iter_num, samples=iter_num * train.micro_batch_size, lengths=total_lengths
+            )
+            throughput.compute_and_log(step=iter_num)
             metrics = {
                 "loss": loss,
-                "iter": state["iter_num"],
-                "step": state["step_count"],
+                "iter": iter_num,
+                "step": step_count,
                 "epoch": train_iterator.epoch,
                 "iter_time": t1 - iter_t0,
                 "tokens": token_counts["raw_tokens_plus_prompt_template"],
                 "total_tokens": token_counts["raw_tokens_plus_prompt_template"] * fabric.world_size,
                 "learning_rate": scheduler.get_last_lr()[0],
             }
-            if isinstance(val_loss, torch.Tensor):
-                val_loss = f"{val_loss:.3f}"
+            # if isinstance(val_loss, torch.Tensor):
+            #     val_loss = f"{val_loss:.3f}"
             # fabric.print(
-            #    f"Epoch {metrics['epoch'] + 1} | iter {metrics['iter']} step {metrics['step']} |"
-            #    f" loss train: {metrics['loss']:.3f},"
-            #    f" val: {val_loss} |"
-            #    f" iter time: {metrics['iter_time'] * 1000:.2f} ms"
-            #    f"{' (step)' if not is_accumulating else ''}"
+            #     f"Epoch {metrics['epoch'] + 1} | iter {metrics['iter']} step {metrics['step']} |"
+            #     f" loss train: {metrics['loss']:.3f},"
+            #     f" val: {val_loss} |"
+            #     f" iter time: {metrics['iter_time'] * 1000:.2f} ms"
+            #     f"{' (step)' if not is_accumulating else ''}"
             # )
-            fabric.log_dict(metrics, step=state["iter_num"])
+            # pbar.set_postfix_str(
+            #     f"loss train: {metrics['loss']:.3f},"
+            #     f"loss val: {val_loss} |"
+            # )
+            fabric.log_dict(metrics, step=iter_num)
 
-        if not is_accumulating and state["step_count"] % eval.interval == 0:
+        if not is_accumulating and step_count % eval.interval == 0:
             t0 = time.perf_counter()
             val_loss = validate(fabric, model, val_dataloader, eval)
             generate_example(fabric, model, tokenizer, eval, data)
@@ -351,16 +428,16 @@ def fit(
             fabric.all_reduce(val_time_tensor, reduce_op="mean")
 
             fabric.print(
-                f"iter {state['iter_num']}: val loss {val_loss_tensor.item():.4f}, val time: {val_time_tensor.item() * 1000:.2f} ms"
+                f"iter {iter_num}: val loss {val_loss_tensor.item():.4f}, val time: {val_time_tensor.item() * 1000:.2f} ms"
             )
             metrics = {"val_loss": val_loss_tensor, "val_ppl": math.exp(val_loss_tensor)}
-            fabric.log_dict(metrics, step=state["iter_num"])
+            fabric.log_dict(metrics, step=iter_num)
             fabric.barrier()
-        if train.save_interval is not None and not is_accumulating and state["step_count"] % train.save_interval == 0:
-            checkpoint_file = out_dir / f"step-{state['step_count']:06d}" / "lit_model.pth"
+
+        if train.save_interval is not None and not is_accumulating and step_count % train.save_interval == 0:
+            checkpoint_file = out_dir / f"step-{step_count:06d}" / "lit_model.pth.oft"
             checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
-            fabric.print(f"Saving checkpoint to {str(checkpoint_file.parent)!r}")
-            fabric.save(checkpoint_file, state)
+            save_oft_checkpoint(fabric, model, checkpoint_file)
             if fabric.global_rank == 0:
                 copy_config_files(checkpoint_dir, checkpoint_file.parent)
                 save_hyperparameters(setup, checkpoint_file.parent)
@@ -377,6 +454,7 @@ def fit(
 
 
 # FSDP has issues with `inference_mode`
+'''
 @torch.no_grad()
 def validate(
     fabric: L.Fabric, model: GPT, val_dataloader: DataLoader, eval: EvalArgs, verbose: bool = True
@@ -393,21 +471,19 @@ def validate(
         losses[k] = chunked_cross_entropy(logits[..., :-1, :], targets[..., 1:], chunk_size=0)
 
     val_loss = losses.mean()
+
     model.train()
     return val_loss
-
+'''
 
 @torch.no_grad()
 def generate_example(fabric: L.Fabric, model: GPT, tokenizer: Tokenizer, eval: EvalArgs, data: DataModule):
     instruction = select_sft_generate_example(eval, data)
+
     fabric.print(instruction)
     prompt = data.prompt_style.apply(instruction)
     encoded = tokenizer.encode(prompt, device=fabric.device)
     model.eval()
-
-    with fabric.init_tensor():
-        # do not set `max_seq_length=max_returned_token` because memory is not a concern here
-        model.set_kv_cache(batch_size=1)
 
     max_returned_tokens = len(encoded) + eval.max_new_tokens
 
@@ -456,6 +532,11 @@ def get_longest_seq_length(data: List[Dict]) -> Tuple[int, int]:
     longest_seq_length = max(lengths)
     longest_seq_ix = lengths.index(longest_seq_length)
     return longest_seq_length, longest_seq_ix
+
+
+def save_oft_checkpoint(fabric: L.Fabric, model: torch.nn.Module, file_path: Path) -> None:
+    fabric.print(f"Saving OFT weights to {str(file_path)!r}")
+    fabric.save(file_path, {"model": model}, filter={"model": oft_filter})
 
 
 def validate_args(train: TrainArgs, eval: EvalArgs) -> None:

@@ -13,7 +13,7 @@ from tqdm.auto import tqdm
 import lightning as L
 import torch
 import torch.nn as nn
-from lightning.fabric.strategies import FSDPStrategy, DDPStrategy
+from lightning.fabric.strategies import FSDPStrategy, DeepSpeedStrategy, DDPStrategy
 from lightning.fabric.utilities.throughput import ThroughputMonitor, measure_flops
 from torch.utils.data import DataLoader
 from torchmetrics.aggregation import RunningMean
@@ -23,7 +23,8 @@ from litgpt import Tokenizer
 from litgpt.args import EvalArgs, LogArgs, TrainArgs
 from litgpt.config import name_to_config
 from litgpt.data import DataModule, TinyLlama
-from litgpt.model import GPT, Block, CausalSelfAttention, Config, LLaMAMLP
+from litgpt.oft import OFTLayer, GPT, Block, LLaMAMLP, Config, CausalSelfAttention, oft_filter, mark_only_oft_as_trainable
+# from litgpt.model import GPT, Block, CausalSelfAttention, Config, LLaMAMLP
 from litgpt.utils import (
     CycleIterator,
     capture_hparams,
@@ -43,6 +44,21 @@ from litgpt.utils import (
     save_hyperparameters,
 )
 
+from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
+from transformers.trainer_pt_utils import get_parameter_names
+
+import os
+
+@torch.no_grad()
+def normalize_frozen_base_weights(model, frozen_base_ids):
+    for mod_name, mod in model.named_modules():
+        w = getattr(mod, "weight", None)
+        # if not isinstance(w, torch.nn.Parameter) or w.ndim != 2:
+        #     continue
+        if id(w) in frozen_base_ids:
+            denom = w.norm(dim=1, keepdim=True).clamp_min_(1e-12)
+            w.div_(denom)  # in-place
+
 
 def setup(
     model_name: str,
@@ -51,6 +67,15 @@ def setup(
     precision: Literal["bf16-true", "bf16-mixed", "32-true", None] = None,
     initial_checkpoint_dir: Optional[Path] = None,
     resume: Union[bool, Literal["auto"], Path] = False,
+    initialization: Literal["same_as_base", "normalized"] = "normalized",
+    oft_block_size: int = 32,
+    oft_query: bool = True,
+    oft_key: bool = False,
+    oft_value: bool = True,
+    oft_projection: bool = False,
+    oft_mlp: bool = False,
+    oft_head: bool = False,
+    poet: Optional[Dict] = None,
     data: Optional[DataModule] = None,
     train: TrainArgs = TrainArgs(
         save_interval=1000,
@@ -123,6 +148,13 @@ def setup(
     data = TinyLlama() if data is None else data
 
     config = Config.from_name(model_name) if model_config is None else model_config
+    config.oft_block_size = oft_block_size
+    config.oft_query = oft_query
+    config.oft_key = oft_key
+    config.oft_value = oft_value
+    config.oft_projection = oft_projection
+    config.oft_mlp = oft_mlp
+    config.oft_head = oft_head
     precision = precision or get_default_supported_precision(training=True)
     devices = parse_devices(devices)
 
@@ -130,7 +162,7 @@ def setup(
     # Setup logger
     ########################
     project_name = f"sPOET-{model_name}-{train.max_tokens/1e9}B-tokens-dev"
-    run_name = f"adamw-lr-{optimizer['init_args']['lr']}-min_lr_ratio-{train.min_lr_ratio}-wd-{optimizer['init_args']['weight_decay']}-warmup-{train.lr_warmup_steps}-max_norm-{train.max_norm}"
+    run_name = f"poet-bs-{oft_block_size}-lr-{optimizer['init_args']['lr']}-min_lr_ratio-{train.min_lr_ratio}-poet_lr-{poet['poet_lr']}-wd-{optimizer['init_args']['weight_decay']}-warmup-{train.lr_warmup_steps}-max_norm-{train.max_norm}-init-{initialization}-head-{oft_head}"
     out_dir = Path(f"saves/{project_name}/{run_name}")
     out_dir = init_out_dir(out_dir)
     logger = choose_logger(
@@ -148,8 +180,14 @@ def setup(
     tokenizer = Tokenizer(tokenizer_dir) if tokenizer_dir is not None else None
 
     if devices * num_nodes > 1:
-        # strategy = FSDPStrategy(auto_wrap_policy={Block}, state_dict_type="full", sharding_strategy="FULL_SHARD")
         strategy = DDPStrategy()
+        # strategy = FSDPStrategy(auto_wrap_policy={Block}, state_dict_type="full", sharding_strategy="NO_SHARD") # FULL_SHARD, SHARD_GRAD_OP, NO_SHARD
+        # strategy = DeepSpeedStrategy(
+        #     stage=2,
+        #     config={
+        #         "gradient_clipping": train.max_norm,
+        #     }
+        # )
     else:
         strategy = "auto"
 
@@ -171,6 +209,7 @@ def setup(
         seed=seed,
         initial_checkpoint_dir=initial_checkpoint_dir,
         resume=resume,
+        initialization=initialization,
         config=config,
         data=data,
         out_dir=out_dir,
@@ -179,6 +218,7 @@ def setup(
         train=train,
         eval=eval,
         optimizer=optimizer,
+        poet=poet,
     )
 
 
@@ -188,6 +228,7 @@ def main(
     seed: int,
     initial_checkpoint_dir: Optional[Path],
     resume: Union[bool, Literal["auto"], Path],
+    initialization: Literal["same_as_base", "normalized"],
     config: Config,
     data: DataModule,
     out_dir: Path,
@@ -196,6 +237,7 @@ def main(
     train: TrainArgs,
     eval: EvalArgs,
     optimizer: Union[str, Dict],
+    poet: Optional[Dict],
     num_nodes: int = 1,
 ) -> None:
     validate_args(train, eval, initial_checkpoint_dir, resume)
@@ -210,6 +252,31 @@ def main(
         model = GPT(config)
 
     initialize_weights(fabric, model, n_layer=config.n_layer, n_embd=config.n_embd)
+    mark_only_oft_as_trainable(model)
+
+    # Update the OFT layers
+    frozen_base_ids = set()
+    for name, module in model.named_modules():
+        if isinstance(module, OFTLayer):
+            module.gradient_accumulation_steps = train.gradient_accumulation_iters(devices)
+            module.poet_reset_gap = poet['poet_reset_gap']
+            base = module.linear
+            for param in base.parameters(recurse=True):
+                frozen_base_ids.add(id(param))
+
+    # Reinitialize the model parameters
+    if initialization == "normalized":
+        fabric.print("Normalizing frozen base weights ...")
+        normalize_frozen_base_weights(model, frozen_base_ids)
+    
+    for name, param in model.named_parameters():
+        if config.oft_head is False and 'lm_head' in name:
+            param.requires_grad = True
+        if param.requires_grad:
+            continue
+        if id(param) in frozen_base_ids:
+            continue
+        param.requires_grad = True
 
     if train.tie_embeddings:
         model.transformer.wte.weight = model.lm_head.weight
@@ -222,10 +289,58 @@ def main(
     # model = torch.compile(model)
     model = fabric.setup(model)
 
-    # extra_kwargs = {"fused": fabric.device.type == "cuda"}
-    optimizer = instantiate_torch_optimizer(optimizer, model.parameters()) #, **extra_kwargs)
+    extra_kwargs = {"fused": fabric.device.type == "cuda"}
+    poet_params = []
+    for name, param in model.named_parameters():
+        if param.requires_grad and 'oft' in name:
+            poet_params.append(param)
+
+    id_poet_params = {id(param) for param in poet_params}
+    decay_params, nodecay_params = [], []  # they are non-poet parameters
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if id(param) in id_poet_params:
+            continue
+        if param.ndim >= 2 and not name.endswith('bias'):
+            decay_params.append(param)
+        else:
+            nodecay_params.append(param)
+
+    base_lr = optimizer['init_args'].pop('lr')
+    poet_lr = poet.pop('poet_lr')
+    poet_weight_decay = poet.pop('poet_weight_decay')
+    weight_decay = optimizer['init_args'].pop('weight_decay')
+
+    in_params = 0
+    out_params = 0
+    for name, param in model.named_parameters():
+        if 'lm_head' in name:
+            if 'oft_I' in name or 'oft_O' in name:
+                print(name, param.shape)
+        if 'oft_I' in name:
+            in_params += (config.oft_block_size * param.shape[0])
+        if 'oft_O' in name:
+            out_params += (config.oft_block_size * param.shape[0])
+    print(f"in_params: {in_params}, out_params: {out_params}")
+
+    # poet params
+    param_groups = [
+        dict(params=nodecay_params, weight_decay=0.0, lr=base_lr),
+        dict(params=decay_params, weight_decay=weight_decay, lr=base_lr),
+        dict(params=poet_params, weight_decay=poet_weight_decay, lr=poet_lr, use_poet=True),
+    ]
+
+    if poet is not None:
+        extra_kwargs.update(poet)
+
+    # optimizer = instantiate_torch_optimizer(optimizer, model.parameters())
+    optimizer = instantiate_torch_optimizer(optimizer, param_groups, **extra_kwargs)
     optimizer = fabric.setup_optimizers(optimizer)
 
+    fabric.print(f"Number of trainable parameters: {num_parameters(model, requires_grad=True):,}")
+    fabric.print(f"Number of non-trainable parameters: {num_parameters(model, requires_grad=False):,}")
+    
     train_dataloader, val_dataloader = get_dataloaders(fabric, data, tokenizer, train, model.max_seq_length)
     train_dataloader, val_dataloader = fabric.setup_dataloaders(train_dataloader, val_dataloader)
 
@@ -238,6 +353,10 @@ def main(
         "train_dataloader": train_dataloader,
         "iter_num": 0,
         "step_count": 0,
+        "lr": base_lr,
+        "min_lr": base_lr * train.min_lr_ratio,
+        "poet_lr": poet_lr,
+        "min_poet_lr": poet_lr * train.min_lr_ratio,
     }
 
     resume = find_resume_path(resume, out_dir)
@@ -326,7 +445,7 @@ def fit(
         measured_flops = measure_flops(meta_model, model_fwd, model_loss)
         fabric.print(f"Measured TFLOPs: {measured_flops * fabric.world_size / 1e12:.2f}")
         del meta_model, x
-
+    
     max_tokens_per_device = train.max_tokens // fabric.world_size
     tokens_per_iter = train.micro_batch_size * model.max_seq_length
     max_iters = max_tokens_per_device // tokens_per_iter
@@ -345,22 +464,25 @@ def fit(
     # setup tqdm progress bar over the training steps
     grad_accum = train.gradient_accumulation_iters(devices, num_nodes)
     max_steps = max_iters // grad_accum
-    min_lr = optimizer.defaults["lr"] * train.min_lr_ratio
     # pbar = tqdm(
     #     total=max_steps,
     #     desc="Training",
     #     dynamic_ncols=True,
     #     disable=fabric.global_rank !=0,
     # )
-
+    
     for train_data in train_iterator:
         if state["iter_num"] >= max_iters:
             break
 
         # determine and set the learning rate for this iteration
-        lr = get_lr(optimizer.defaults["lr"], state["iter_num"], warmup_iters, max_iters, min_lr)
+        lr = get_lr(state["lr"], state["iter_num"], warmup_iters, max_iters, state["min_lr"])
+        poet_lr = get_lr(state["poet_lr"], state["iter_num"], warmup_iters, max_iters, state["min_poet_lr"])
         for param_group in optimizer.param_groups:
-            param_group["lr"] = lr
+            if param_group.get('use_poet', False):
+                param_group["lr"] = poet_lr
+            else:
+                param_group["lr"] = lr
 
         state["iter_num"] += 1
         iter_t0 = time.perf_counter()
@@ -377,6 +499,7 @@ def fit(
         running_loss.update(loss.detach())
 
         if not is_accumulating:
+            # DeepSpeed will clip gradients automatically. TODO: check if this is correct.
             grad_norm_before_clip = fabric.clip_gradients(model, optimizer, max_norm=train.max_norm)
             optimizer.step()
             optimizer.zero_grad()
@@ -405,7 +528,9 @@ def fit(
                 ),
                 "tokens": state["iter_num"] * train.micro_batch_size * model.max_seq_length,
                 "total_tokens": (state["iter_num"] * train.micro_batch_size * model.max_seq_length * fabric.world_size),
-                "learning_rate": lr,
+                # "learning_rate": lr,
+                "learning_rate": optimizer.param_groups[0]["lr"],  # Base LR (same for groups 0 and 1)
+                "poet_learning_rate": optimizer.param_groups[2]["lr"],
             }
             if isinstance(val_loss, float):
                 val_loss = f"{val_loss:.3f}"
@@ -502,9 +627,14 @@ def initialize_weights(fabric: L.Fabric, model: GPT, n_layer: int, n_embd: int) 
     # Adapted from https://github.com/jzhang38/TinyLlama
 
     def init_weights(module, std):
-        nn.init.normal_(module.weight, mean=0.0, std=std)
-        if getattr(module, "bias", None) is not None:
-            nn.init.zeros_(module.bias)
+        if isinstance(module, OFTLayer):
+            nn.init.normal_(module.linear.weight, mean=0.0, std=std)
+            if getattr(module.linear, "bias", None) is not None:
+                nn.init.zeros_(module.linear.bias)
+        else:
+            nn.init.normal_(module.weight, mean=0.0, std=std)
+            if getattr(module, "bias", None) is not None:
+                nn.init.zeros_(module.bias)
 
     for mod in model.modules():
         if isinstance(mod, (nn.Embedding, nn.Linear)):

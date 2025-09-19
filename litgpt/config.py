@@ -852,6 +852,34 @@ for c in llama_3:
         copy["hf_config"]["name"] = c["hf_config"]["name"].format(kind)
         configs.append(copy)
 
+
+#########################
+# NVIDIA ngpt
+#########################
+ngpt = [
+    # https://huggingface.co/meta-llama/Meta-Llama-3.1-8B/blob/main/config.json
+    dict(
+        name="nGPT-8B",
+        hf_config=dict(org="nvidia", name="nGPT-8B{}"),
+        block_size=131072,
+        vocab_size=128000,
+        padded_vocab_size=128256,
+        n_layer=32,
+        n_head=32,
+        n_query_groups=8,
+        rotary_percentage=1.0,
+        parallel_residual=False,
+        bias=False,
+        norm_class_name="RMSNorm",
+        mlp_class_name="LLaMAMLP",
+        intermediate_size=14336,
+        rope_base=500000,
+        rope_adjustments=dict(factor=8.0, low_freq_factor=1.0, high_freq_factor=4.0, original_max_seq_len=8192),
+    ),
+]
+configs.extend(ngpt)
+
+
 #########################
 # NVIDIA Llama Nemotron
 #########################

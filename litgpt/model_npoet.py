@@ -154,6 +154,8 @@ class GPT(nn.Module):
         if self.config.scale_embeddings:
             x = x * torch.tensor(self.config.n_embd**0.5, dtype=x.dtype)
 
+        breakpoint()
+
         for block_idx, block in enumerate(self.transformer.h):
             if self.config.rope_indices is not None:
                 x = block(

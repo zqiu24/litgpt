@@ -612,9 +612,14 @@ class LLaMAMLP(litgpt.model.LLaMAMLP):
     def __init__(self, config: Config, intermediate_size: Optional[int] = None) -> None:
         nn.Module.__init__(self)
         self.intermediate_size = intermediate_size or config.intermediate_size
-        self.fc_1 = create_lora_linear(config, config.n_embd, self.intermediate_size)
-        self.fc_2 = create_lora_linear(config, config.n_embd, self.intermediate_size)
+        # self.fc_1 = create_lora_linear(config, config.n_embd, self.intermediate_size)
+        # self.fc_1 = nn.Linear(config.n_embd, self.intermediate_size, bias=config.bias)
+        # self.fc_2 = create_lora_linear(config, config.n_embd, self.intermediate_size)
+        # self.fc_2 = nn.Linear(config.n_embd, self.intermediate_size, bias=config.bias)
+        # self.fc = nn.Linear(config.n_embd, self.intermediate_size * 2, bias=config.bias)
+        self.fc = create_lora_linear(config, config.n_embd, self.intermediate_size * 2)
         self.proj = create_lora_linear(config, self.intermediate_size, config.n_embd)
+        # self.proj = nn.Linear(self.intermediate_size, config.n_embd, bias=config.bias)
         self.config = config
 
     def _load_from_state_dict(self, state_dict: Dict, prefix: str, *args: Any, **kwargs: Any) -> None:
