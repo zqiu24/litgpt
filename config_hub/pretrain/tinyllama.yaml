@@ -24,7 +24,7 @@ initial_checkpoint_dir:
 resume: false
 
 # Data-related arguments. If not provided, the default is ``litgpt.data.TinyLlama``.
-data: TinyLlama
+data: TinyStories
 
 # Training-related arguments. See ``litgpt.args.TrainArgs`` for details
 train:

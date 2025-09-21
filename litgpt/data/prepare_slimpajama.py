@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 from litgpt.data.prepare_starcoder import DataChunkRecipe
+from litdata import TokensLoader
 from litgpt.tokenizer import Tokenizer
 from litgpt.utils import CLI, extend_checkpoint_dir
 
@@ -49,8 +50,9 @@ def prepare(
         input_dir=str(input_dir),
         output_dir=str(output_dir),
         fast_dev_run=fast_dev_run,
-        num_workers=os.cpu_count(),
+        num_workers=64,
         num_downloaders=1,
+        item_loader=TokensLoader(),
     )
 
     start_time = time.time()

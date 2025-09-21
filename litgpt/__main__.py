@@ -21,7 +21,7 @@ from litgpt.generate.sequentially import main as generate_sequentially_fn
 from litgpt.generate.speculative_decoding import main as generate_speculatively_fn
 from litgpt.generate.tp import main as generate_tp_fn
 from litgpt.pretrain import setup as pretrain_fn
-from litgpt.pretrain_ngpt import setup as pretrain_ngpt_fn
+# from litgpt.pretrain_ngpt import setup as pretrain_ngpt_fn
 from litgpt.pretrain_poet import setup as pretrain_poet_fn
 from litgpt.pretrain_lora import setup as pretrain_lora_fn
 from litgpt.scripts.convert_hf_checkpoint import convert_hf_checkpoint as convert_hf_checkpoint_fn
@@ -46,7 +46,7 @@ def main() -> None:
         "pretrain": pretrain_fn,
         "pretrain_poet": pretrain_poet_fn,
         "pretrain_lora": pretrain_lora_fn,
-        "pretrain_ngpt": pretrain_ngpt_fn,
+        # "pretrain_ngpt": pretrain_ngpt_fn,
         "generate": generate_base_fn,
         "generate_full": generate_full_fn,
         "generate_adapter": generate_adapter_fn,

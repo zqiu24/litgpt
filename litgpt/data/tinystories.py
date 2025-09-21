@@ -47,6 +47,7 @@ class TinyStories(DataModule):
 
     def prepare_data(self) -> None:
         from litdata import optimize
+        from litdata.streaming import TokensLoader
 
         download(self.data_path)
 
@@ -55,7 +56,7 @@ class TinyStories(DataModule):
         assert len(files) > 1, f"Expected at least two json files in {files}"
         # train/test split. let's use only shard 0 for test split, rest train
         val_file, *train_files = files
-        num_workers = os.cpu_count() - 1
+        num_workers = 32 # os.cpu_count() - 1
 
         if not Path(self.data_path_train).is_dir():
             validate_tokenizer(self.tokenizer)
@@ -65,6 +66,7 @@ class TinyStories(DataModule):
                 output_dir=str(self.data_path_train),
                 num_workers=num_workers,
                 chunk_bytes="200MB",
+                item_loader=TokensLoader(),
             )
         if not Path(self.data_path_val).is_dir():
             validate_tokenizer(self.tokenizer)
@@ -74,6 +76,7 @@ class TinyStories(DataModule):
                 output_dir=str(self.data_path_val),
                 num_workers=1,  # there's only 1 file
                 chunk_bytes="200MB",
+                item_loader=TokensLoader(),
             )
 
     def train_dataloader(self) -> DataLoader:

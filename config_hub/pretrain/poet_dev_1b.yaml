@@ -62,7 +62,8 @@ poet:
   poet_weight_decay: 0.0
 
 # Data-related arguments. If not provided, the default is ``litgpt.data.TinyLlama``.
-data: TinyLlama
+data: TinyStories
+#data: TinyLlama
 
 # Training-related arguments. See ``litgpt.args.TrainArgs`` for details
 train:
@@ -143,7 +144,7 @@ num_nodes: 1
 
 # Optional path to the tokenizer dir that was used for preprocessing the dataset. Only some data
 # module require this. (type: Optional[Path], default: null)
-# tokenizer_dir: checkpoints/meta-llama/Llama-2-7b-hf
+tokenizer_dir: checkpoints/meta-llama/Llama-3.1-8B
 
 # The name of the logger to send metrics to. (type: Literal['wandb', 'tensorboard', 'csv'], default: tensorboard)
 logger_name: wandb

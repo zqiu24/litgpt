@@ -4,6 +4,7 @@ import os
 import time
 import traceback
 from pathlib import Path
+from litdata import TokensLoader
 
 from lightning_utilities.core.imports import RequirementCache
 
@@ -67,8 +68,10 @@ def prepare(
         input_dir=str(input_dir),
         output_dir=str(output_dir),
         fast_dev_run=fast_dev_run,
-        num_workers=os.cpu_count(),
+        # num_workers=os.cpu_count()-10,
+        num_workers=64,
         num_downloaders=1,
+        item_loader=TokensLoader(),
     )
 
     start_time = time.time()

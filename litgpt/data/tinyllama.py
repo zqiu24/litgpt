@@ -33,10 +33,11 @@ class TinyLlama(DataModule):
     def __post_init__(self):
         super().__init__()
         # Could be a remote path (s3://) or a local path
-        self.slimpajama_train = str(self.data_path).rstrip("/") + "/slimpajama/train"
+        self.slimpajama_train = str(self.data_path).rstrip("/") + "/slimpajama/val"
         self.slimpajama_val = str(self.data_path).rstrip("/") + "/slimpajama/val"
         self.required_paths = [self.slimpajama_train, self.slimpajama_val]
 
+        self.use_starcoder = False
         if self.use_starcoder:
             self.starcoder_train = str(self.data_path).rstrip("/") + "/starcoder"
             self.required_paths += [self.starcoder_train]
